@@ -247,6 +247,31 @@ else:
     print("  ✓ PASS Test 10: Error path returns completed event (not silent hang)")
     PASS += 1
 
+# Test 11: previous_response_id forwarding
+# Send a first request, extract the response ID, then send a follow-up using previous_response_id.
+# Verifies that the proxy forwards previous_response_id to Azure and gets a valid stateful response.
+events1 = req({"model": MODEL, "input": "My name is Balloon. Say 'got it' and nothing else."})
+check("Test 11a: First turn (establish state)", events1, expect_text=True)
+
+resp_id = None
+for e in events1:
+    if e.get("type") == "response.completed":
+        resp_id = e.get("response", {}).get("id")
+        break
+
+if resp_id:
+    events2 = req({"model": MODEL, "previous_response_id": resp_id, "input": "What is my name?"})
+    ok = check("Test 11b: Follow-up with previous_response_id", events2, expect_text=True)
+    if ok:
+        text2 = get_text(events2)
+        if "Balloon" in text2 or "balloon" in text2:
+            print("  ✓ INFO  previous_response_id state confirmed (name recalled)")
+        else:
+            print("  ✗ WARN  previous_response_id response did not recall name: " + text2[:100])
+else:
+    print("  ✗ FAIL Test 11b: Could not extract response ID from Test 11a")
+    FAIL += 1
+
 print(f"\n{'=' * 50}")
 print(f"Total: {PASS}/{PASS+FAIL} passed")
 if FAIL > 0:

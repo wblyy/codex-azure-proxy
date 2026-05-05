@@ -22,98 +22,6 @@ function log() {
   console.error.apply(console, args);
 }
 
-function inputToMessages(input, instructions) {
-  var messages = [];
-  if (instructions) messages.push({ role: "system", content: instructions });
-  if (typeof input === "string") {
-    messages.push({ role: "user", content: input });
-  } else if (Array.isArray(input)) {
-    for (var i = 0; i < input.length; i++) {
-      var item = input[i];
-      if (item.type === "function_call") {
-        // Codex Responses API → Chat Completions.
-        // ALL of these patterns must collapse into ONE assistant message per turn:
-        //   [fc1,fc2,fco1,fco2]      (parallel tools)
-        //   [text,fc,fco]            (text then tool in same output)
-        //   [fc,text,fco]            (tool then text, text sandwiched before result)
-        var tc = {
-          id: item.call_id || item.id || ("call_" + i),
-          type: "function",
-          function: {
-            name: item.name || "",
-            arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
-          },
-        };
-        var lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
-        if (lastMsg && lastMsg.role === "assistant") {
-          // Merge into existing assistant message regardless of whether it already has tool_calls.
-          // Handles: consecutive FCs (parallel), text+FC (same turn), FC+text already merged.
-          if (lastMsg.tool_calls) {
-            lastMsg.tool_calls.push(tc);
-          } else {
-            lastMsg.tool_calls = [tc];
-          }
-        } else {
-          messages.push({ role: "assistant", content: null, tool_calls: [tc] });
-        }
-      } else if (item.type === "function_call_output") {
-        messages.push({
-          role: "tool",
-          tool_call_id: item.call_id || item.id || "unknown",
-          content: typeof item.output === "string" ? item.output : JSON.stringify(item.output),
-        });
-      } else if (item.role === "assistant" && item.content) {
-        // Assistant text message.
-        // If the last message is already assistant with tool_calls (i.e. we're inside
-        // a tool-call turn and this text was sandwiched between fc and fco in the output),
-        // merge the text INTO that message rather than creating a new one.
-        // This handles the real Codex pattern: [fc, text_msg, fco] → one assistant msg.
-        var aContent = item.content;
-        var textVal;
-        if (Array.isArray(aContent)) {
-          textVal = aContent.filter(function(c) {
-            return c.type === "output_text" || c.type === "text" || typeof c === "string";
-          }).map(function(c) { return typeof c === "string" ? c : (c.text || c.output || ""); }).join("") || null;
-        } else {
-          textVal = typeof aContent === "string" ? aContent : null;
-        }
-        var lastMsgA = messages.length > 0 ? messages[messages.length - 1] : null;
-        if (lastMsgA && lastMsgA.role === "assistant" && lastMsgA.tool_calls) {
-          // Sandwiched text: merge content into the pending tool-call assistant message
-          lastMsgA.content = textVal;
-        } else {
-          messages.push({ role: "assistant", content: textVal || "" });
-        }
-      } else if (item.role) {
-        var content = item.content;
-        if (Array.isArray(content))
-          content = content.map(function(c) { return typeof c === "string" ? c : (c.text || c.value || ""); }).join("");
-        messages.push({ role: item.role, content: content || "" });
-      } else if (item.type === "message") {
-        var content2 = item.content;
-        if (Array.isArray(content2))
-          content2 = content2.map(function(c) { return typeof c === "string" ? c : (c.text || c.value || ""); }).join("");
-        messages.push({ role: item.role || "user", content: content2 || "" });
-      }
-    }
-  }
-  return messages;
-}
-
-function convertTools(tools) {
-  if (!tools || !tools.length) return undefined;
-  return tools.filter(function(t) { return t.type === "function" || t.name; }).map(function(t) {
-    return {
-      type: "function",
-      function: {
-        name: t.name || (t.function && t.function.name),
-        description: t.description || (t.function && t.function.description) || "",
-        parameters: t.parameters || (t.function && t.function.parameters) || { type: "object", properties: {} },
-      },
-    };
-  });
-}
-
 var CRLF = "\r\n";
 
 function writeSSEHeaders(socket, statusCode) {
@@ -132,106 +40,24 @@ function sendEvent(socket, type, data) {
   socket.write("data: " + JSON.stringify(obj) + "\n\n");
 }
 
-// Compress input[] to prevent context bloat on long-running sessions.
-// Codex sends full history every request — without compression, sessions with
-// 100+ tool rounds grow to 700+ items, causing Azure to time out.
-//
-// Strategy: keep the full recent tail intact (last KEEP_TAIL items),
-// and compress older tool-call rounds into a compact summary message
-// so key information is preserved without sending raw history.
-var KEEP_TAIL = 60;   // ~10-15 recent tool rounds kept verbatim
-var COMPRESS_THRESHOLD = KEEP_TAIL + 20; // only compress when clearly worth it
-
-function compressInput(input) {
-  if (!Array.isArray(input) || input.length <= COMPRESS_THRESHOLD) return input;
-
-  // Find the first user message — keep it as task anchor
-  var firstUserIdx = -1;
-  for (var i = 0; i < input.length; i++) {
-    var it = input[i];
-    if (it.role === "user" || (it.type === "message" && it.role === "user")) {
-      firstUserIdx = i;
-      break;
-    }
-  }
-  if (firstUserIdx === -1) firstUserIdx = 0;
-
-  var tailStart = input.length - KEEP_TAIL;
-  if (tailStart <= firstUserIdx + 1) return input; // nothing to compress
-
-  // Build a summary of the middle section (tool calls + results + assistant text)
-  var middle = input.slice(firstUserIdx + 1, tailStart);
-  var fcNames = {}; // call_id -> tool name
-  var summaryLines = [];
-
-  for (var j = 0; j < middle.length; j++) {
-    var item = middle[j];
-    if (item.type === "function_call") {
-      fcNames[item.call_id || item.id] = item.name || "tool";
-    } else if (item.type === "function_call_output") {
-      var toolName = fcNames[item.call_id || item.id] || "tool";
-      var out = typeof item.output === "string" ? item.output : JSON.stringify(item.output || "");
-      summaryLines.push("- " + toolName + "() → " + out.slice(0, 120).replace(/\n/g, " "));
-    } else if ((item.role === "assistant" || item.role === "user") && item.content) {
-      var txt = item.content;
-      if (Array.isArray(txt)) txt = txt.map(function(c) { return c.text || c.output || ""; }).join(" ");
-      if (typeof txt === "string" && txt.trim()) {
-        summaryLines.push("[" + item.role + "] " + txt.trim().slice(0, 120).replace(/\n/g, " "));
-      }
-    }
-  }
-
-  var summaryMsg = {
-    type: "message",
-    role: "user",
-    content: "[Prior context summary — " + middle.length + " items compressed]\n" +
-      summaryLines.slice(-80).join("\n"),  // cap at 80 lines to avoid runaway
-  };
-
-  var result = [input[firstUserIdx], summaryMsg].concat(input.slice(tailStart));
-  log("input compressed: " + input.length + " -> " + result.length +
-    " items (" + middle.length + " old items summarized, last " + KEEP_TAIL + " kept verbatim)");
-  return result;
-}
-
+// Direct pass-through: forward Codex Responses API request to Azure Responses API.
+// Azure supports native Responses API at $AZURE_BASE/responses?api-version=2025-04-01-preview.
+// SSE event format is byte-for-byte identical to OpenAI — no conversion needed.
 function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
   var model = modelOverride || reqBody.model || "gpt-5.5";
-  // Log raw input structure for debugging (truncated per item)
-  if (Array.isArray(reqBody.input) && reqBody.input.length > 1) {
-    var inputSummary = reqBody.input.map(function(it, idx) {
-      return idx + ":" + (it.type || it.role || "?") + (it.name ? "(" + it.name + ")" : "") + (it.call_id ? "[" + it.call_id.slice(0,8) + "]" : "");
-    }).join(" ");
-    log("input-items[" + reqBody.input.length + "]:", inputSummary);
-  }
-  var compressedInput = compressInput(reqBody.input);
-  var messages = inputToMessages(compressedInput, reqBody.instructions);
-  // Log generated messages structure
-  var msgSummary = messages.map(function(m) {
-    return m.role + (m.tool_calls ? "(tc:" + m.tool_calls.length + ")" : "") + (m.tool_call_id ? "[" + m.tool_call_id.slice(0,8) + "]" : "");
-  }).join(" -> ");
-  log("messages[" + messages.length + "]:", msgSummary);
-  var tools = convertTools(reqBody.tools);
+  var inputLen = Array.isArray(reqBody.input) ? reqBody.input.length : (reqBody.input ? 1 : 0);
+  var hasPrevId = !!reqBody.previous_response_id;
+  log("request: model=" + model + " input_items=" + inputLen + " prev_id=" + hasPrevId);
 
-  var chatBody = {
-    model: model,
-    messages: messages,
-    stream: true,
-    max_completion_tokens: reqBody.max_output_tokens || reqBody.max_completion_tokens || 16000,
-  };
-  if (tools && tools.length) {
-    chatBody.tools = tools;
-    if (reqBody.tool_choice) chatBody.tool_choice = reqBody.tool_choice;
-  }
-  if (reqBody.reasoning_effort) chatBody.reasoning_effort = reqBody.reasoning_effort;
-  if (reqBody.temperature !== undefined) chatBody.temperature = reqBody.temperature;
-
-  var azureUrl = new URL(AZURE_BASE + "/deployments/" + encodeURIComponent(model) + "/chat/completions");
+  // Forward request body as-is, only override model and ensure stream=true
+  var azureBody = Object.assign({}, reqBody, { model: model, stream: true });
+  var azureUrl = new URL(AZURE_BASE + "/responses");
   azureUrl.searchParams.set("api-version", AZURE_API_VERSION);
-  var bodyStr = JSON.stringify(chatBody);
+  var bodyStr = JSON.stringify(azureBody);
 
-  log("-> Azure", azureUrl.pathname, "model=" + model, "msgs=" + messages.length);
+  log("-> Azure", azureUrl.pathname + azureUrl.search, "model=" + model);
 
-  var AZURE_TIMEOUT_MS = 60000; // 60s — if Azure doesn't respond, send error event instead of hanging forever
+  var AZURE_TIMEOUT_MS = 60000;
   var azReq = https.request({
     hostname: azureUrl.hostname,
     port: 443,
@@ -246,16 +72,13 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
   }, function(azRes) {
     log("<- Azure status=" + azRes.statusCode);
 
-    var respId = "resp_" + Date.now();
-    var itemId = "msg_" + Date.now();
-
-    writeSSEHeaders(socket, 200);
-
     if (azRes.statusCode !== 200) {
       var errData = "";
       azRes.on("data", function(d) { errData += d; });
       azRes.on("end", function() {
-        log("Azure error:", errData);
+        log("Azure error:", errData.slice(0, 300));
+        var respId = "resp_err_" + Date.now();
+        writeSSEHeaders(socket, 200);
         sendEvent(socket, "response.completed", {
           response: { id: respId, status: "incomplete", error: { code: "api_error", message: errData } },
         });
@@ -264,111 +87,16 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
       return;
     }
 
-    sendEvent(socket, "response.created", {
-      response: { id: respId, object: "realtime.response", status: "in_progress", model: model },
-    });
-    sendEvent(socket, "response.in_progress", {
-      response: { id: respId, object: "realtime.response", status: "in_progress", model: model },
-    });
-    sendEvent(socket, "response.output_item.added", {
-      response_id: respId, output_index: 0,
-      item: { id: itemId, object: "realtime.item", type: "message", role: "assistant", content: [] },
-    });
-    sendEvent(socket, "response.content_part.added", {
-      response_id: respId, item_id: itemId, output_index: 0, content_index: 0,
-      part: { type: "output_text", text: "" },
-    });
-
-    var fullText = "";
-    var toolCalls = {};
-    var buf = "";
-
+    // Write HTTP headers to client then pipe Azure SSE bytes straight through.
+    // Azure Responses API SSE format is identical to OpenAI — no conversion needed.
+    writeSSEHeaders(socket, 200);
     azRes.on("data", function(chunk) {
-      buf += chunk.toString();
-      var lines = buf.split("\n");
-      buf = lines.pop();
-      for (var i = 0; i < lines.length; i++) {
-        var line = lines[i];
-        if (line.indexOf("data: ") !== 0) continue;
-        var data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-        var obj;
-        try { obj = JSON.parse(data); } catch(e) { continue; }
-        var choice = obj.choices && obj.choices[0];
-        if (!choice) continue;
-        var delta = choice.delta || {};
-        if (delta.content) {
-          fullText += delta.content;
-          sendEvent(socket, "response.output_text.delta", {
-            response_id: respId, item_id: itemId,
-            output_index: 0, content_index: 0, delta: delta.content,
-          });
-        }
-        if (delta.tool_calls) {
-          for (var j = 0; j < delta.tool_calls.length; j++) {
-            var tc = delta.tool_calls[j];
-            var idx = tc.index !== undefined ? tc.index : 0;
-            if (!toolCalls[idx]) toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
-            if (tc.id) toolCalls[idx].id = tc.id;
-            if (tc.function && tc.function.name) toolCalls[idx].function.name += tc.function.name;
-            if (tc.function && tc.function.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
-          }
-        }
-      }
+      socket.write(chunk);
     });
-
     azRes.on("end", function() {
-      if (fullText) {
-        sendEvent(socket, "response.output_text.done", {
-          response_id: respId, item_id: itemId,
-          output_index: 0, content_index: 0, text: fullText,
-        });
-        sendEvent(socket, "response.content_part.done", {
-          response_id: respId, item_id: itemId, output_index: 0, content_index: 0,
-          part: { type: "output_text", text: fullText },
-        });
-      }
-
-      var tcList = Object.values(toolCalls);
-      var outputItems = [];
-      if (fullText) {
-        outputItems.push({
-          type: "message", id: itemId, role: "assistant",
-          content: [{ type: "output_text", text: fullText }],
-        });
-        sendEvent(socket, "response.output_item.done", {
-          response_id: respId, output_index: 0, item: outputItems[0],
-        });
-      } else {
-        sendEvent(socket, "response.output_item.done", {
-          response_id: respId, output_index: 0,
-          item: { type: "message", id: itemId, role: "assistant", content: [] },
-        });
-      }
-
-      for (var k = 0; k < tcList.length; k++) {
-        var tc2 = tcList[k];
-        var fcItem = {
-          type: "function_call", id: tc2.id, call_id: tc2.id,
-          name: tc2.function.name, arguments: tc2.function.arguments,
-        };
-        outputItems.push(fcItem);
-        sendEvent(socket, "response.output_item.done", {
-          response_id: respId, output_index: (fullText ? 1 : 0) + k, item: fcItem,
-        });
-      }
-
-      sendEvent(socket, "response.completed", {
-        response: {
-          id: respId, object: "realtime.response", status: "completed", model: model,
-          output: outputItems,
-        },
-      });
-
-      log("Done: respId=" + respId + " text_len=" + fullText.length + " tools=" + tcList.length);
+      log("Done: stream ended model=" + model);
       done();
     });
-
     azRes.on("error", function(e) { log("stream error:", e.message); done(e); });
   });
 
@@ -436,7 +164,7 @@ function handleMITMSocket(clearSocket) {
         "HTTP/1.1 200 OK" + CRLF +
         "Content-Type: application/json" + CRLF +
         "Connection: close" + CRLF + CRLF +
-        JSON.stringify({ ok: true, proxy: "codex-azure-mitm-v3" })
+        JSON.stringify({ ok: true, proxy: "codex-azure-mitm-v4" })
       );
       clearSocket.end();
       return;
@@ -597,7 +325,8 @@ var server = net.createServer(function(clientSocket) {
 });
 
 server.listen(PORT, "127.0.0.1", function() {
-  log("Codex Azure MITM Proxy v3 on 127.0.0.1:" + PORT);
+  log("Codex Azure MITM Proxy v4 on 127.0.0.1:" + PORT);
+  log("Mode: direct Responses API pass-through (no format conversion)");
   log("Intercepting: " + TARGET_HOST);
   log("AZURE_BASE: " + AZURE_BASE);
   log("AZURE_KEY: " + (AZURE_KEY ? AZURE_KEY.slice(0, 8) + "..." : "(not set)"));
