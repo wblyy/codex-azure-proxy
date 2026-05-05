@@ -6,16 +6,11 @@ const fs = require("node:fs");
 const { URL } = require("node:url");
 
 const PORT = Number(process.env.PROXY_PORT) || 8765;
-const CERTS_DIR = process.env.CERTS_DIR || (process.env.HOME + "/codex-proxy/certs");
-const AZURE_BASE = process.env.AZURE_BASE_URL || "";
+const CERTS_DIR = process.env.CERTS_DIR || "/Users/balloon/codex-proxy/certs";
+const AZURE_BASE = process.env.AZURE_BASE_URL || "https://binl-mdi7xat3-eastus2.services.ai.azure.com/openai";
 const AZURE_KEY = process.env.OPENAI_API_KEY || "";
 const AZURE_API_VERSION = process.env.AZURE_API_VERSION || "2025-04-01-preview";
 const TARGET_HOST = "api.openai.com";
-
-if (!AZURE_BASE) {
-  console.error("[proxy] ERROR: AZURE_BASE_URL not set");
-  process.exit(1);
-}
 
 const fakeCert = fs.readFileSync(CERTS_DIR + "/api.openai.com.crt");
 const fakeKey  = fs.readFileSync(CERTS_DIR + "/api.openai.com.key");
@@ -27,19 +22,6 @@ function log() {
   console.error.apply(console, args);
 }
 
-// Convert Codex Responses API input[] to Azure Chat Completions messages[].
-//
-// Azure rules:
-//   1. content:null only allowed when tool_calls is present
-//   2. All parallel tool_calls from one turn MUST be in ONE assistant message
-//   3. role:"tool" messages must immediately follow the assistant with matching tool_calls
-//
-// Real Codex input patterns (from proxy logs):
-//   [fc1,fc2,fco1,fco2]           parallel tools
-//   [text,fc,fco]                 text then tool in same output turn
-//   [fc,text_msg,fco]             tool sandwiched by text — merge text into assistant
-//   [fc1,fco1,text,fc2,fco2]      sequential rounds
-//   [fc1,fc2,fco1,fco2,text,fc3]  mixed parallel + sequential
 function inputToMessages(input, instructions) {
   var messages = [];
   if (instructions) messages.push({ role: "system", content: instructions });
@@ -49,19 +31,23 @@ function inputToMessages(input, instructions) {
     for (var i = 0; i < input.length; i++) {
       var item = input[i];
       if (item.type === "function_call") {
+        // Codex Responses API → Chat Completions.
+        // ALL of these patterns must collapse into ONE assistant message per turn:
+        //   [fc1,fc2,fco1,fco2]      (parallel tools)
+        //   [text,fc,fco]            (text then tool in same output)
+        //   [fc,text,fco]            (tool then text, text sandwiched before result)
         var tc = {
           id: item.call_id || item.id || ("call_" + i),
           type: "function",
           function: {
             name: item.name || "",
-            arguments: typeof item.arguments === "string"
-              ? item.arguments
-              : JSON.stringify(item.arguments || {}),
+            arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
           },
         };
         var lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
         if (lastMsg && lastMsg.role === "assistant") {
-          // Merge into existing assistant (handles parallel FCs + sandwiched-text pattern)
+          // Merge into existing assistant message regardless of whether it already has tool_calls.
+          // Handles: consecutive FCs (parallel), text+FC (same turn), FC+text already merged.
           if (lastMsg.tool_calls) {
             lastMsg.tool_calls.push(tc);
           } else {
@@ -74,46 +60,39 @@ function inputToMessages(input, instructions) {
         messages.push({
           role: "tool",
           tool_call_id: item.call_id || item.id || "unknown",
-          content: typeof item.output === "string"
-            ? item.output
-            : JSON.stringify(item.output),
+          content: typeof item.output === "string" ? item.output : JSON.stringify(item.output),
         });
       } else if (item.role === "assistant" && item.content) {
+        // Assistant text message.
+        // If the last message is already assistant with tool_calls (i.e. we're inside
+        // a tool-call turn and this text was sandwiched between fc and fco in the output),
+        // merge the text INTO that message rather than creating a new one.
+        // This handles the real Codex pattern: [fc, text_msg, fco] → one assistant msg.
         var aContent = item.content;
         var textVal;
         if (Array.isArray(aContent)) {
           textVal = aContent.filter(function(c) {
             return c.type === "output_text" || c.type === "text" || typeof c === "string";
-          }).map(function(c) {
-            return typeof c === "string" ? c : (c.text || c.output || "");
-          }).join("") || null;
+          }).map(function(c) { return typeof c === "string" ? c : (c.text || c.output || ""); }).join("") || null;
         } else {
           textVal = typeof aContent === "string" ? aContent : null;
         }
         var lastMsgA = messages.length > 0 ? messages[messages.length - 1] : null;
         if (lastMsgA && lastMsgA.role === "assistant" && lastMsgA.tool_calls) {
-          // Sandwiched text: merge content into the pending tool-call assistant message.
-          // content:null is fine here since tool_calls is present.
+          // Sandwiched text: merge content into the pending tool-call assistant message
           lastMsgA.content = textVal;
         } else {
-          // Text-only assistant message — Azure requires content to be a non-null string.
           messages.push({ role: "assistant", content: textVal || "" });
         }
       } else if (item.role) {
         var content = item.content;
-        if (Array.isArray(content)) {
-          content = content.map(function(c) {
-            return typeof c === "string" ? c : (c.text || c.value || "");
-          }).join("");
-        }
+        if (Array.isArray(content))
+          content = content.map(function(c) { return typeof c === "string" ? c : (c.text || c.value || ""); }).join("");
         messages.push({ role: item.role, content: content || "" });
       } else if (item.type === "message") {
         var content2 = item.content;
-        if (Array.isArray(content2)) {
-          content2 = content2.map(function(c) {
-            return typeof c === "string" ? c : (c.text || c.value || "");
-          }).join("");
-        }
+        if (Array.isArray(content2))
+          content2 = content2.map(function(c) { return typeof c === "string" ? c : (c.text || c.value || ""); }).join("");
         messages.push({ role: item.role || "user", content: content2 || "" });
       }
     }
@@ -123,17 +102,13 @@ function inputToMessages(input, instructions) {
 
 function convertTools(tools) {
   if (!tools || !tools.length) return undefined;
-  return tools.filter(function(t) {
-    return t.type === "function" || t.name;
-  }).map(function(t) {
+  return tools.filter(function(t) { return t.type === "function" || t.name; }).map(function(t) {
     return {
       type: "function",
       function: {
         name: t.name || (t.function && t.function.name),
         description: t.description || (t.function && t.function.description) || "",
-        parameters: t.parameters || (t.function && t.function.parameters) || {
-          type: "object", properties: {},
-        },
+        parameters: t.parameters || (t.function && t.function.parameters) || { type: "object", properties: {} },
       },
     };
   });
@@ -157,28 +132,84 @@ function sendEvent(socket, type, data) {
   socket.write("data: " + JSON.stringify(obj) + "\n\n");
 }
 
-function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
-  var model = modelOverride || reqBody.model || "gpt-4o";
+// Compress input[] to prevent context bloat on long-running sessions.
+// Codex sends full history every request — without compression, sessions with
+// 100+ tool rounds grow to 700+ items, causing Azure to time out.
+//
+// Strategy: keep the full recent tail intact (last KEEP_TAIL items),
+// and compress older tool-call rounds into a compact summary message
+// so key information is preserved without sending raw history.
+var KEEP_TAIL = 60;   // ~10-15 recent tool rounds kept verbatim
+var COMPRESS_THRESHOLD = KEEP_TAIL + 20; // only compress when clearly worth it
 
-  // Log input structure for debugging
+function compressInput(input) {
+  if (!Array.isArray(input) || input.length <= COMPRESS_THRESHOLD) return input;
+
+  // Find the first user message — keep it as task anchor
+  var firstUserIdx = -1;
+  for (var i = 0; i < input.length; i++) {
+    var it = input[i];
+    if (it.role === "user" || (it.type === "message" && it.role === "user")) {
+      firstUserIdx = i;
+      break;
+    }
+  }
+  if (firstUserIdx === -1) firstUserIdx = 0;
+
+  var tailStart = input.length - KEEP_TAIL;
+  if (tailStart <= firstUserIdx + 1) return input; // nothing to compress
+
+  // Build a summary of the middle section (tool calls + results + assistant text)
+  var middle = input.slice(firstUserIdx + 1, tailStart);
+  var fcNames = {}; // call_id -> tool name
+  var summaryLines = [];
+
+  for (var j = 0; j < middle.length; j++) {
+    var item = middle[j];
+    if (item.type === "function_call") {
+      fcNames[item.call_id || item.id] = item.name || "tool";
+    } else if (item.type === "function_call_output") {
+      var toolName = fcNames[item.call_id || item.id] || "tool";
+      var out = typeof item.output === "string" ? item.output : JSON.stringify(item.output || "");
+      summaryLines.push("- " + toolName + "() → " + out.slice(0, 120).replace(/\n/g, " "));
+    } else if ((item.role === "assistant" || item.role === "user") && item.content) {
+      var txt = item.content;
+      if (Array.isArray(txt)) txt = txt.map(function(c) { return c.text || c.output || ""; }).join(" ");
+      if (typeof txt === "string" && txt.trim()) {
+        summaryLines.push("[" + item.role + "] " + txt.trim().slice(0, 120).replace(/\n/g, " "));
+      }
+    }
+  }
+
+  var summaryMsg = {
+    type: "message",
+    role: "user",
+    content: "[Prior context summary — " + middle.length + " items compressed]\n" +
+      summaryLines.slice(-80).join("\n"),  // cap at 80 lines to avoid runaway
+  };
+
+  var result = [input[firstUserIdx], summaryMsg].concat(input.slice(tailStart));
+  log("input compressed: " + input.length + " -> " + result.length +
+    " items (" + middle.length + " old items summarized, last " + KEEP_TAIL + " kept verbatim)");
+  return result;
+}
+
+function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
+  var model = modelOverride || reqBody.model || "gpt-5.5";
+  // Log raw input structure for debugging (truncated per item)
   if (Array.isArray(reqBody.input) && reqBody.input.length > 1) {
     var inputSummary = reqBody.input.map(function(it, idx) {
-      return idx + ":" + (it.type || it.role || "?") +
-        (it.name ? "(" + it.name + ")" : "") +
-        (it.call_id ? "[" + it.call_id.slice(0, 8) + "]" : "");
+      return idx + ":" + (it.type || it.role || "?") + (it.name ? "(" + it.name + ")" : "") + (it.call_id ? "[" + it.call_id.slice(0,8) + "]" : "");
     }).join(" ");
     log("input-items[" + reqBody.input.length + "]:", inputSummary);
   }
-
-  var messages = inputToMessages(reqBody.input, reqBody.instructions);
-
+  var compressedInput = compressInput(reqBody.input);
+  var messages = inputToMessages(compressedInput, reqBody.instructions);
+  // Log generated messages structure
   var msgSummary = messages.map(function(m) {
-    return m.role +
-      (m.tool_calls ? "(tc:" + m.tool_calls.length + ")" : "") +
-      (m.tool_call_id ? "[" + m.tool_call_id.slice(0, 8) + "]" : "");
+    return m.role + (m.tool_calls ? "(tc:" + m.tool_calls.length + ")" : "") + (m.tool_call_id ? "[" + m.tool_call_id.slice(0,8) + "]" : "");
   }).join(" -> ");
   log("messages[" + messages.length + "]:", msgSummary);
-
   var tools = convertTools(reqBody.tools);
 
   var chatBody = {
@@ -194,19 +225,19 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
   if (reqBody.reasoning_effort) chatBody.reasoning_effort = reqBody.reasoning_effort;
   if (reqBody.temperature !== undefined) chatBody.temperature = reqBody.temperature;
 
-  var azureUrl = new URL(
-    AZURE_BASE + "/deployments/" + encodeURIComponent(model) + "/chat/completions"
-  );
+  var azureUrl = new URL(AZURE_BASE + "/deployments/" + encodeURIComponent(model) + "/chat/completions");
   azureUrl.searchParams.set("api-version", AZURE_API_VERSION);
   var bodyStr = JSON.stringify(chatBody);
 
   log("-> Azure", azureUrl.pathname, "model=" + model, "msgs=" + messages.length);
 
+  var AZURE_TIMEOUT_MS = 60000; // 60s — if Azure doesn't respond, send error event instead of hanging forever
   var azReq = https.request({
     hostname: azureUrl.hostname,
     port: 443,
     path: azureUrl.pathname + azureUrl.search,
     method: "POST",
+    timeout: AZURE_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(bodyStr),
@@ -226,10 +257,7 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
       azRes.on("end", function() {
         log("Azure error:", errData);
         sendEvent(socket, "response.completed", {
-          response: {
-            id: respId, status: "incomplete",
-            error: { code: "api_error", message: errData },
-          },
+          response: { id: respId, status: "incomplete", error: { code: "api_error", message: errData } },
         });
         done();
       });
@@ -265,7 +293,7 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
         var data = line.slice(6).trim();
         if (data === "[DONE]") continue;
         var obj;
-        try { obj = JSON.parse(data); } catch (e) { continue; }
+        try { obj = JSON.parse(data); } catch(e) { continue; }
         var choice = obj.choices && obj.choices[0];
         if (!choice) continue;
         var delta = choice.delta || {};
@@ -280,14 +308,10 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
           for (var j = 0; j < delta.tool_calls.length; j++) {
             var tc = delta.tool_calls[j];
             var idx = tc.index !== undefined ? tc.index : 0;
-            if (!toolCalls[idx]) {
-              toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
-            }
+            if (!toolCalls[idx]) toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
             if (tc.id) toolCalls[idx].id = tc.id;
             if (tc.function && tc.function.name) toolCalls[idx].function.name += tc.function.name;
-            if (tc.function && tc.function.arguments) {
-              toolCalls[idx].function.arguments += tc.function.arguments;
-            }
+            if (tc.function && tc.function.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
           }
         }
       }
@@ -348,6 +372,19 @@ function handleOpenAIRequest(reqBody, socket, modelOverride, done) {
     azRes.on("error", function(e) { log("stream error:", e.message); done(e); });
   });
 
+  azReq.on("timeout", function() {
+    log("Azure request timed out after " + (AZURE_TIMEOUT_MS / 1000) + "s — sending error to Codex");
+    azReq.destroy();
+    var respId = "resp_timeout_" + Date.now();
+    writeSSEHeaders(socket, 200);
+    sendEvent(socket, "response.completed", {
+      response: {
+        id: respId, status: "incomplete",
+        error: { code: "timeout", message: "Azure request timed out after " + (AZURE_TIMEOUT_MS / 1000) + "s" },
+      },
+    });
+    done();
+  });
   azReq.on("error", function(e) { log("az request error:", e.message); done(e); });
   azReq.write(bodyStr);
   azReq.end();
@@ -399,7 +436,7 @@ function handleMITMSocket(clearSocket) {
         "HTTP/1.1 200 OK" + CRLF +
         "Content-Type: application/json" + CRLF +
         "Connection: close" + CRLF + CRLF +
-        JSON.stringify({ ok: true, proxy: "codex-azure-mitm" })
+        JSON.stringify({ ok: true, proxy: "codex-azure-mitm-v3" })
       );
       clearSocket.end();
       return;
@@ -413,10 +450,12 @@ function handleMITMSocket(clearSocket) {
       try {
         var reqBody = JSON.parse(parsed.body.toString("utf8"));
         handleOpenAIRequest(reqBody, clearSocket, null, function(err) {
-          if (err) log("handler error:", err.message || err);
+          if (err) {
+            log("handler error:", err.message || err);
+          }
           clearSocket.end();
         });
-      } catch (e) {
+      } catch(e) {
         log("parse error:", e.message);
         clearSocket.write(
           "HTTP/1.1 500 Internal Server Error" + CRLF +
@@ -439,10 +478,8 @@ function handleMITMSocket(clearSocket) {
 
 function tunnelDirect(clientSocket, host, port, head) {
   var target = net.connect(port, host, function() {
-    clientSocket.write(
-      "HTTP/1.1 200 Connection Established" + CRLF +
-      "Proxy-Agent: codex-azure-proxy" + CRLF + CRLF
-    );
+    clientSocket.write("HTTP/1.1 200 Connection Established" + CRLF +
+      "Proxy-Agent: codex-azure-proxy" + CRLF + CRLF);
     if (head && head.length > 0) target.write(head);
     target.pipe(clientSocket);
     clientSocket.pipe(target);
@@ -472,46 +509,47 @@ var server = net.createServer(function(clientSocket) {
     var target = parts[1];
 
     if (method !== "CONNECT") {
-      // Plain HTTP proxy request (ClashX may forward as plain HTTP, not CONNECT)
+      // Plain HTTP proxy request (Clash Party forwards as HTTP, not CONNECT tunnel)
+      // target may be full URL like "https://api.openai.com/v1/responses" or just "/responses"
       log("plain-HTTP:", method, target);
 
+      // Parse path from full URL if needed
       var plainPath = target;
       if (target && target.indexOf("://") !== -1) {
-        try { plainPath = new URL(target).pathname; } catch (e) { plainPath = target; }
+        try {
+          plainPath = new (require("node:url").URL)(target).pathname;
+        } catch(e) { plainPath = target; }
       }
 
-      var isResponsesPlain = plainPath === "/v1/responses" || plainPath === "/responses" ||
+      var isResponses = plainPath === "/v1/responses" || plainPath === "/responses" ||
         /^\/openai\/deployments\/[^/]+\/responses$/.test(plainPath) ||
         /^\/deployments\/[^/]+\/responses$/.test(plainPath);
 
-      if (method === "POST" && isResponsesPlain) {
+      if (method === "POST" && isResponses) {
+        // Parse full request with body
         var allLines = header.split("\r\n");
         var plainHeaders = {};
         for (var hi = 1; hi < allLines.length; hi++) {
           var ci = allLines[hi].indexOf(":");
           if (ci === -1) continue;
-          plainHeaders[allLines[hi].slice(0, ci).toLowerCase().trim()] =
-            allLines[hi].slice(ci + 1).trim();
+          plainHeaders[allLines[hi].slice(0, ci).toLowerCase().trim()] = allLines[hi].slice(ci + 1).trim();
         }
         var plainCL = parseInt(plainHeaders["content-length"] || "0", 10);
-        var bodyBuf = remaining;
 
+        // Accumulate body then handle
+        var bodyBuf = remaining;
         function tryHandlePlain() {
-          if (bodyBuf.length < plainCL) return;
+          if (bodyBuf.length < plainCL) return; // need more data
           clientSocket.removeListener("data", onBodyData);
           try {
-            var reqBody = JSON.parse(
-              bodyBuf.slice(0, plainCL || bodyBuf.length).toString("utf8")
-            );
+            var reqBody = JSON.parse(bodyBuf.slice(0, plainCL || bodyBuf.length).toString("utf8"));
             handleOpenAIRequest(reqBody, clientSocket, null, function(err) {
               if (err) log("plain handler error:", err.message || err);
               clientSocket.end();
             });
-          } catch (e) {
+          } catch(e) {
             log("plain parse error:", e.message);
-            clientSocket.write(
-              "HTTP/1.1 500 Internal Server Error" + CRLF + "Connection: close" + CRLF + CRLF
-            );
+            clientSocket.write("HTTP/1.1 500 Internal Server Error" + CRLF + "Connection: close" + CRLF + CRLF);
             clientSocket.end();
           }
         }
@@ -521,6 +559,7 @@ var server = net.createServer(function(clientSocket) {
         return;
       }
 
+      // Unknown non-CONNECT request
       clientSocket.write("HTTP/1.1 400 Bad Request" + CRLF + CRLF);
       clientSocket.end();
       return;
@@ -533,10 +572,8 @@ var server = net.createServer(function(clientSocket) {
     log("CONNECT", host + ":" + port);
 
     if (host === TARGET_HOST) {
-      clientSocket.write(
-        "HTTP/1.1 200 Connection Established" + CRLF +
-        "Proxy-Agent: codex-azure-mitm" + CRLF + CRLF
-      );
+      clientSocket.write("HTTP/1.1 200 Connection Established" + CRLF +
+        "Proxy-Agent: codex-azure-mitm" + CRLF + CRLF);
 
       var tlsSock = new tls.TLSSocket(clientSocket, {
         isServer: true,
@@ -560,7 +597,7 @@ var server = net.createServer(function(clientSocket) {
 });
 
 server.listen(PORT, "127.0.0.1", function() {
-  log("Codex Azure MITM Proxy on 127.0.0.1:" + PORT);
+  log("Codex Azure MITM Proxy v3 on 127.0.0.1:" + PORT);
   log("Intercepting: " + TARGET_HOST);
   log("AZURE_BASE: " + AZURE_BASE);
   log("AZURE_KEY: " + (AZURE_KEY ? AZURE_KEY.slice(0, 8) + "..." : "(not set)"));

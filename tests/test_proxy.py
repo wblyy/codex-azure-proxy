@@ -218,6 +218,35 @@ events = req({
 })
 check("Test 8: Null/empty content assistant message (Bug 4 regression)", events)
 
+# Test 9: Context compression — send 200 input items, verify proxy compresses and still responds
+# Proxy compresses items >80 (COMPRESS_THRESHOLD) into a summary + recent tail.
+# We can't easily test the internal compression, but we can verify the proxy
+# still returns a valid response without hanging or erroring.
+big_input = [{"role": "user", "content": "Large session test"}]
+for i in range(100):
+    cid = f"call_big{i:03d}"
+    big_input.append({"type": "function_call", "call_id": cid, "name": "shell",
+                       "arguments": f'{{"cmd":"echo step{i}"}}'})
+    big_input.append({"type": "function_call_output", "call_id": cid, "output": f"step{i} output"})
+events = req({"model": MODEL, "tools": TOOLS, "input": big_input})
+check("Test 9: Large context (200 items) triggers compression and returns", events)
+
+# Test 10: Timeout behavior — proxy should return an error event, not hang.
+# We test this by hitting a known-bad endpoint that forces a quick Azure 404,
+# which exercises the error path (can't easily force a real timeout in unit test).
+events = req({
+    "model": "nonexistent-model-xyz-404",
+    "input": "Simple test that will hit Azure 404",
+})
+# Should return completed event (possibly with error), not hang
+completed = any(e.get("type") == "response.completed" for e in events)
+if not completed:
+    print("  ✗ FAIL Test 10: Timeout/error path — no completed event returned")
+    FAIL += 1
+else:
+    print("  ✓ PASS Test 10: Error path returns completed event (not silent hang)")
+    PASS += 1
+
 print(f"\n{'=' * 50}")
 print(f"Total: {PASS}/{PASS+FAIL} passed")
 if FAIL > 0:
