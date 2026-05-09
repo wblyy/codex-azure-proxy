@@ -1,3 +1,22 @@
+# ── Codex Azure Proxy Setup for Windows ──────────────────────────────
+# Fill in your Azure credentials below before running:
+$AZURE_KEY  = "YOUR_AZURE_API_KEY_HERE"
+$AZURE_BASE = "YOUR_AZURE_BASE_URL_HERE"
+$AZURE_VER  = "2025-04-01-preview"
+$PROXY_DIR  = "$env:USERPROFILE\.codex\proxy"
+$CODEX_CFG  = "$env:USERPROFILE\.codex\config.toml"
+
+if ($AZURE_KEY -eq "YOUR_AZURE_API_KEY_HERE") {
+    Write-Host "ERROR: Please fill in AZURE_KEY and AZURE_BASE at the top of this script."
+    exit 1
+}
+
+Write-Host "[1/5] Creating proxy directory..."
+New-Item -ItemType Directory -Force -Path $PROXY_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path "$PROXY_DIR\certs" | Out-Null
+
+Write-Host "[2/5] Writing proxy.js..."
+$PROXY_JS = @'
 "use strict";
 const net = require("node:net");
 const tls = require("node:tls");
@@ -340,3 +359,70 @@ server.listen(PORT, "127.0.0.1", function() {
 server.on("error", function(e) { log("Server error:", e.message); process.exit(1); });
 process.on("SIGTERM", function() { server.close(); process.exit(0); });
 process.on("SIGINT", function() { server.close(); process.exit(0); });
+
+'@
+[System.IO.File]::WriteAllText("$PROXY_DIR\proxy.js", $PROXY_JS, [System.Text.Encoding]::UTF8)
+Write-Host "  Done: $PROXY_DIR\proxy.js"
+
+Write-Host "[3/5] Updating config.toml..."
+$TOML_HEADER = "model = `"gpt-5.5`"`r`nmodel_reasoning_effort = `"medium`"`r`nmodel_provider = `"azure-proxy`"`r`n`r`n[model_providers.azure-proxy]`r`nname = `"Azure OpenAI (via local proxy)`"`r`nbase_url = `"http://127.0.0.1:8765`"`r`nenv_key = `"OPENAI_API_KEY`"`r`nwire_api = `"responses`"`r`n`r`n"
+if (Test-Path $CODEX_CFG) {
+    $existing = [System.IO.File]::ReadAllText($CODEX_CFG)
+    if ($existing -notmatch "azure-proxy") {
+        [System.IO.File]::WriteAllText($CODEX_CFG, $TOML_HEADER + $existing, [System.Text.Encoding]::UTF8)
+        Write-Host "  config.toml updated"
+    } else { Write-Host "  config.toml already configured, skipped" }
+} else {
+    [System.IO.File]::WriteAllText($CODEX_CFG, $TOML_HEADER, [System.Text.Encoding]::UTF8)
+    Write-Host "  config.toml created"
+}
+
+Write-Host "[4/5] Setting OPENAI_API_KEY..."
+[System.Environment]::SetEnvironmentVariable("OPENAI_API_KEY", $AZURE_KEY, "User")
+$env:OPENAI_API_KEY = $AZURE_KEY
+Write-Host "  Set (user-level, persists across reboots)"
+
+Write-Host "[5/5] Starting proxy and creating auto-start task..."
+$node = (Get-Command node -ErrorAction SilentlyContinue)
+if (-not $node) {
+    Write-Host ""
+    Write-Host "  !! Node.js not found. Install from https://nodejs.org/en/download (LTS)"
+    Write-Host "  !! After installing, re-run this script."
+    exit 1
+}
+$nodePath = $node.Source
+
+$existing = Get-NetTCPConnection -LocalPort 8765 -ErrorAction SilentlyContinue
+if ($existing) {
+    $pid = ($existing | Select-Object -First 1).OwningProcess
+    Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    Write-Host "  Stopped previous proxy (PID $pid)"
+}
+
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $nodePath
+$psi.Arguments = "`"$PROXY_DIR\proxy.js`""
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.EnvironmentVariables["OPENAI_API_KEY"]      = $AZURE_KEY
+$psi.EnvironmentVariables["AZURE_BASE_URL"]       = $AZURE_BASE
+$psi.EnvironmentVariables["AZURE_API_VERSION"]    = $AZURE_VER
+$psi.EnvironmentVariables["CERTS_DIR"]            = "$PROXY_DIR\certs"
+$proc = [System.Diagnostics.Process]::Start($psi)
+Start-Sleep 2
+if ($proc -and !$proc.HasExited) {
+    Write-Host "  Proxy running PID=$($proc.Id) on 127.0.0.1:8765"
+} else {
+    Write-Host "  !! Proxy failed to start. Check: node `"$PROXY_DIR\proxy.js`""
+}
+
+$action   = New-ScheduledTaskAction -Execute $nodePath -Argument "`"$PROXY_DIR\proxy.js`"" -WorkingDirectory $PROXY_DIR
+$trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "CodexAzureProxy" -Action $action -Trigger $trigger `
+    -Settings $settings -Principal $principal -Force | Out-Null
+Write-Host "  Task 'CodexAzureProxy' registered (runs at logon)"
+
+Write-Host ""
+Write-Host "Setup complete! Restart Codex -> bottom right: 'Azure OpenAI (via local proxy)'"
